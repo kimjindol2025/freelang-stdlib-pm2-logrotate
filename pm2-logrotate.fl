@@ -1,0 +1,350 @@
+/**
+ * FreeLang stdlib — pm2-logrotate
+ *
+ * npm pm2-logrotate 완전 대체 구현
+ * 로그 파일 로테이션 / gzip 압축 / 보관 파일 정리
+ *
+ * 사용 예시:
+ *   import "stdlib/pm2-logrotate"
+ *
+ *   // 기본 설정
+ *   configure({
+ *     logPath:        "/var/log/app/app.log",
+ *     maxSize:        "10M",
+ *     maxFiles:       30,
+ *     compress:       true,
+ *     dateFormat:     "YYYY-MM-DD",
+ *     workerInterval: 30,
+ *     rotateInterval: "0 0 * * *"
+ *   })
+ *
+ *   // 수동 즉시 로테이션
+ *   let result = rotate()
+ *   println(result.rotated)     // 로테이션된 파일 경로
+ *   println(result.compressed)  // 압축된 파일 경로 (compress: true 시)
+ *   println(result.deleted)     // 삭제된 파일 수
+ *
+ *   // 개별 함수 사용
+ *   compress("/var/log/app/app.log.1")
+ *   cleanup("/var/log/app", 30)
+ *
+ * 네이티브 함수 (src/stdlib-logrotate.ts):
+ *   logrotate_file_size(path)              → int  (바이트, -1: 없음)
+ *   logrotate_parse_size(sizeStr)          → int  (바이트 변환)
+ *   logrotate_now_unix()                   → int  (Unix ms)
+ *   logrotate_rotate_file(path, maxN)      → string ("ok:path" | "error:..." | "skip:...")
+ *   logrotate_compress_file(path)          → string ("ok:gz_path" | "error:...")
+ *   logrotate_cleanup_dir(dir, base, max)  → int  (삭제된 파일 수)
+ *   logrotate_list_log_files(dir, base)    → string (JSON)
+ *   logrotate_cron_matches(expr)           → bool
+ *   logrotate_file_exists(path)            → bool
+ */
+
+// ============================================================
+// Struct 정의
+// ============================================================
+
+struct LogrotateConfig {
+  logPath:        string,   // 감시할 로그 파일 절대 경로
+  maxSize:        string,   // 파일 크기 기준 ("10M", "100K", "1G")
+  maxFiles:       int,      // 보관 파일 최대 개수 (기본 30)
+  compress:       bool,     // true → 로테이션 후 gzip 압축
+  dateFormat:     string,   // 파일명 날짜 포맷 (현재: "YYYY-MM-DD")
+  workerInterval: int,      // 크기 체크 주기 (분)
+  rotateInterval: string    // cron 표현식 기반 강제 로테이션 주기
+}
+
+struct RotateResult {
+  success:    bool,
+  rotated:    string,   // 로테이션된 파일 경로 (없으면 "")
+  compressed: string,   // 압축된 .gz 경로 (없으면 "")
+  deleted:    int,      // 삭제된 오래된 파일 수
+  reason:     string    // "size" | "cron" | "manual" | "skip" | "error"
+}
+
+// ============================================================
+// 전역 설정 저장소
+// ============================================================
+
+let _config: LogrotateConfig = {
+  logPath:        "",
+  maxSize:        "10M",
+  maxFiles:       30,
+  compress:       false,
+  dateFormat:     "YYYY-MM-DD",
+  workerInterval: 30,
+  rotateInterval: "0 0 * * *"
+}
+
+let _configured = false
+let _workerRunning = false
+
+// ============================================================
+// 내부 헬퍼
+// ============================================================
+
+fn _dirOf(filePath: string) -> string {
+  let parts = str.split(filePath, "/")
+  arr.pop(parts)
+  if arr.length(parts) == 0 {
+    return "."
+  }
+  return arr.join(parts, "/")
+}
+
+fn _baseOf(filePath: string) -> string {
+  let parts = str.split(filePath, "/")
+  return parts[arr.length(parts) - 1]
+}
+
+fn _parseResult(raw: string) -> map {
+  // "ok:path" | "error:msg" | "skip:reason"
+  let colonIdx = str.indexOf(raw, ":")
+  if colonIdx == -1 {
+    return { status: raw, detail: "" }
+  }
+  let status = str.substr(raw, 0, colonIdx)
+  let detail = str.substr(raw, colonIdx + 1, str.len(raw) - colonIdx - 1)
+  return { status: status, detail: detail }
+}
+
+// ============================================================
+// configure: 설정 적용
+// ============================================================
+
+fn configure(config: LogrotateConfig) -> void {
+  if config.logPath != null && config.logPath != "" {
+    _config.logPath = config.logPath
+  }
+  if config.maxSize != null && config.maxSize != "" {
+    _config.maxSize = config.maxSize
+  }
+  if config.maxFiles > 0 {
+    _config.maxFiles = config.maxFiles
+  }
+  _config.compress = config.compress
+  if config.dateFormat != null && config.dateFormat != "" {
+    _config.dateFormat = config.dateFormat
+  }
+  if config.workerInterval > 0 {
+    _config.workerInterval = config.workerInterval
+  }
+  if config.rotateInterval != null && config.rotateInterval != "" {
+    _config.rotateInterval = config.rotateInterval
+  }
+  _configured = true
+}
+
+// ============================================================
+// compress: 단일 파일 gzip 압축
+// ============================================================
+
+fn compress(filePath: string) -> string {
+  if !logrotate_file_exists(filePath) {
+    return ""
+  }
+  let raw = logrotate_compress_file(filePath)
+  let parsed = _parseResult(raw)
+  if parsed["status"] == "ok" {
+    return parsed["detail"]
+  }
+  return ""
+}
+
+// ============================================================
+// cleanup: 디렉토리 내 오래된 로그 파일 삭제
+// ============================================================
+
+fn cleanup(dir: string, maxFiles: int) -> int {
+  let base = _baseOf(_config.logPath)
+  if base == "" {
+    base = "app.log"
+  }
+  return logrotate_cleanup_dir(dir, base, maxFiles)
+}
+
+// ============================================================
+// getFileList: 현재 로그 파일 목록 조회
+// ============================================================
+
+fn getFileList() -> array {
+  let dir = _dirOf(_config.logPath)
+  let base = _baseOf(_config.logPath)
+  let raw = logrotate_list_log_files(dir, base)
+  return json.parse(raw)
+}
+
+// ============================================================
+// rotate: 즉시 수동 로테이션
+//
+// 동작:
+//   1. 현재 로그 → .1 (기존 .1→.2, .2→.3 ... 순차 이동)
+//   2. compress: true → .1 파일 gzip 압축
+//   3. maxFiles 초과 파일 삭제
+// ============================================================
+
+fn rotate() -> RotateResult {
+  if !_configured || _config.logPath == "" {
+    return {
+      success:    false,
+      rotated:    "",
+      compressed: "",
+      deleted:    0,
+      reason:     "error"
+    }
+  }
+
+  if !logrotate_file_exists(_config.logPath) {
+    return {
+      success:    false,
+      rotated:    "",
+      compressed: "",
+      deleted:    0,
+      reason:     "skip"
+    }
+  }
+
+  // Step 1: 로테이션
+  let rotateRaw = logrotate_rotate_file(_config.logPath, _config.maxFiles)
+  let rotateRes = _parseResult(rotateRaw)
+
+  if rotateRes["status"] != "ok" {
+    return {
+      success:    false,
+      rotated:    "",
+      compressed: "",
+      deleted:    0,
+      reason:     "error"
+    }
+  }
+
+  let rotatedPath = rotateRes["detail"]
+  let compressedPath = ""
+
+  // Step 2: 압축
+  if _config.compress && rotatedPath != "" {
+    compressedPath = compress(rotatedPath)
+  }
+
+  // Step 3: 오래된 파일 정리
+  let dir = _dirOf(_config.logPath)
+  let base = _baseOf(_config.logPath)
+  let deleted = logrotate_cleanup_dir(dir, base, _config.maxFiles)
+
+  return {
+    success:    true,
+    rotated:    rotatedPath,
+    compressed: compressedPath,
+    deleted:    deleted,
+    reason:     "manual"
+  }
+}
+
+// ============================================================
+// checkAndRotate: 조건 기반 자동 로테이션
+//
+// 두 조건 중 하나라도 충족하면 로테이션:
+//   1. 파일 크기 ≥ maxSize
+//   2. rotateInterval cron 표현식이 현재 시각에 매칭
+// ============================================================
+
+fn checkAndRotate() -> RotateResult {
+  if !_configured || _config.logPath == "" {
+    return {
+      success: false, rotated: "", compressed: "", deleted: 0, reason: "error"
+    }
+  }
+
+  // 크기 조건
+  let currentSize = logrotate_file_size(_config.logPath)
+  let maxBytes = logrotate_parse_size(_config.maxSize)
+
+  if currentSize >= maxBytes {
+    let result = rotate()
+    result.reason = "size"
+    return result
+  }
+
+  // cron 조건
+  if logrotate_cron_matches(_config.rotateInterval) {
+    let result = rotate()
+    result.reason = "cron"
+    return result
+  }
+
+  return {
+    success: true, rotated: "", compressed: "", deleted: 0, reason: "skip"
+  }
+}
+
+// ============================================================
+// getStatus: 현재 설정 및 파일 상태 조회
+// ============================================================
+
+fn getStatus() -> map {
+  let currentSize = 0
+  let maxBytes = logrotate_parse_size(_config.maxSize)
+  let fileExists = false
+
+  if _config.logPath != "" {
+    currentSize = logrotate_file_size(_config.logPath)
+    fileExists = logrotate_file_exists(_config.logPath)
+  }
+
+  let usagePercent = 0
+  if maxBytes > 0 && currentSize > 0 {
+    usagePercent = currentSize * 100 / maxBytes
+  }
+
+  return {
+    configured:     _configured,
+    logPath:        _config.logPath,
+    fileExists:     fileExists,
+    currentSize:    currentSize,
+    maxSize:        _config.maxSize,
+    maxBytes:       maxBytes,
+    usagePercent:   usagePercent,
+    maxFiles:       _config.maxFiles,
+    compress:       _config.compress,
+    rotateInterval: _config.rotateInterval,
+    workerInterval: _config.workerInterval
+  }
+}
+
+// ============================================================
+// defaultConfig: 기본 설정 반환
+// ============================================================
+
+fn defaultConfig() -> LogrotateConfig {
+  return {
+    logPath:        "/var/log/app/app.log",
+    maxSize:        "10M",
+    maxFiles:       30,
+    compress:       true,
+    dateFormat:     "YYYY-MM-DD",
+    workerInterval: 30,
+    rotateInterval: "0 0 * * *"
+  }
+}
+
+// ============================================================
+// Export
+// ============================================================
+
+export {
+  // Struct
+  LogrotateConfig,
+  RotateResult,
+
+  // 설정
+  configure,
+  defaultConfig,
+
+  // 핵심 함수
+  rotate,
+  compress,
+  cleanup,
+  checkAndRotate,
+  getFileList,
+  getStatus
+}
